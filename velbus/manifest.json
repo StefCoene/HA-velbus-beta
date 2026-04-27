@@ -1,5 +1,5 @@
 {
-  "domain": "velbus-test",
+  "domain": "velbus",
   "name": "Velbus",
   "version": "1.0.0",
   "codeowners": ["@Cereal2nd", "@brefra"],
