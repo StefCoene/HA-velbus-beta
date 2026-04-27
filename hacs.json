@@ -1,0 +1,6 @@
+{
+  "name": "Velbus beta (custom)",
+  "domains": ["velbus"],
+  "country": "BE",
+  "content_in_root": false
+}
