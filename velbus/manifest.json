@@ -1,7 +1,7 @@
 {
-  "domain": "velbus",
-  "version": "1.0.0",
+  "domain": "velbus-test",
   "name": "Velbus",
+  "version": "1.0.0",
   "codeowners": ["@Cereal2nd", "@brefra"],
   "config_flow": true,
   "dependencies": ["usb", "file_upload"],
