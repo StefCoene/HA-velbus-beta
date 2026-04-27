@@ -15,7 +15,7 @@
     "velbus-protocol"
   ],
   "quality_scale": "silver",
-  "requirements": ["velbus-aio==2026.4.1"],
+  "requirements": ["velbus-aio @ git+https://github.com/StefCoene/velbus-aio.git@master"],
   "usb": [
     {
       "pid": "0B1B",
