@@ -14,7 +14,7 @@ from velbusaio.helpers import get_property_key_map
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady, PlatformNotReady
 from homeassistant.helpers import (
     config_validation as cv,
@@ -22,6 +22,7 @@ from homeassistant.helpers import (
     entity_registry as er,
     issue_registry as ir,
 )
+from homeassistant.helpers.device_registry import EventDeviceRegistryUpdatedData
 from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.helpers.typing import ConfigType
 
@@ -215,6 +216,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
     task = hass.async_create_task(velbus_scan_task(controller, hass, entry.entry_id))
     entry.runtime_data = VelbusData(controller=controller, scan_task=task)
 
+    @callback
+    def _handle_device_registry_updated(
+        event: Event[EventDeviceRegistryUpdatedData],
+    ) -> None:
+        if event.data["action"] != "update":
+            return
+        changes = event.data["changes"]
+        if "via_device_id" not in changes or changes["via_device_id"] is None:
+            return
+        dev_reg = dr.async_get(hass)
+        sub_device = dev_reg.async_get(event.data["device_id"])
+        if (
+            sub_device is None
+            or entry.entry_id not in sub_device.config_entries
+            or sub_device.via_device_id is not None
+        ):
+            return
+        previous_parent_id: str = changes["via_device_id"]
+        if dev_reg.async_get(previous_parent_id) is not None:
+            return
+        dev_reg.async_update_device(
+            sub_device.id, remove_config_entry_id=entry.entry_id
+        )
+
+    entry.async_on_unload(
+        hass.bus.async_listen(
+            dr.EVENT_DEVICE_REGISTRY_UPDATED, _handle_device_registry_updated
+        )
+    )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
@@ -233,6 +264,20 @@ async def async_remove_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> N
         shutil.rmtree,
         hass.config.path(STORAGE_DIR, f"velbuscache-{entry.entry_id}"),
     )
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: VelbusConfigEntry,
+    device_entry: dr.DeviceEntry,
+) -> bool:
+    """Allow removing this config entry from a Velbus device.
+
+    When the config entry is removed from a device, its sub-devices are detached
+    from this config entry as well. If the device is still on the bus, it may be
+    recreated when the integration is reloaded or started again.
+    """
+    return True
 
 
 async def async_migrate_entry(
