@@ -2,7 +2,7 @@
   "domain": "velbus",
   "name": "Velbus",
   "version": "1.0.0",
-  "codeowners": ["@Cereal2nd", "@brefra"],
+  "codeowners": ["@Cereal2nd", "@brefra", "@StefCoene"],
   "config_flow": true,
   "dependencies": ["usb", "file_upload"],
   "documentation": "https://www.home-assistant.io/integrations/velbus",
