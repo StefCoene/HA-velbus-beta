@@ -1,0 +1,274 @@
+diff --git a/homeassistant/components/velbus/__init__.py b/homeassistant/components/velbus/__init__.py
+index 6805e932768..1ad47ab55d7 100644
+--- a/homeassistant/components/velbus/__init__.py
++++ b/homeassistant/components/velbus/__init__.py
+@@ -10,12 +10,18 @@ import shutil
+ 
+ from velbusaio.controller import Velbus
+ from velbusaio.exceptions import VelbusConnectionFailed
++from velbusaio.helpers import get_property_key_map
+ 
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import CONF_PORT, Platform
+ from homeassistant.core import HomeAssistant
+ from homeassistant.exceptions import ConfigEntryNotReady, PlatformNotReady
+-from homeassistant.helpers import config_validation as cv, device_registry as dr
++from homeassistant.helpers import (
++    config_validation as cv,
++    device_registry as dr,
++    entity_registry as er,
++    issue_registry as ir,
++)
+ from homeassistant.helpers.storage import STORAGE_DIR
+ from homeassistant.helpers.typing import ConfigType
+ 
+@@ -48,23 +54,19 @@ class VelbusData:
+     scan_task: asyncio.Task
+ 
+ 
+-async def velbus_scan_task(
+-    controller: Velbus, hass: HomeAssistant, entry_id: str
++def _update_devices_and_issues(
++    hass: HomeAssistant, controller: Velbus, entry_id: str
+ ) -> None:
+-    """Task to offload the long running scan."""
+-    try:
+-        await controller.start()
+-    except ConnectionError as ex:
+-        raise PlatformNotReady(
+-            f"Connection error while connecting to Velbus {entry_id}: {ex}"
+-        ) from ex
+-    # create all modules
++    """Sync device registry and stale-device repair issues with the current bus state."""
+     dev_reg = dr.async_get(hass)
+-    for module in controller.get_modules().values():
++    found_addresses: set[str] = set()
++    for module_address, module in controller.get_modules().items():
++        address = str(module_address)
++        found_addresses.add(address)
+         dev_reg.async_get_or_create(
+             config_entry_id=entry_id,
+             identifiers={
+-                (DOMAIN, str(module.get_addresses()[0])),
++                (DOMAIN, address),
+             },
+             manufacturer="Velleman",
+             model=module.get_type_name(),
+@@ -73,6 +75,53 @@ async def velbus_scan_task(
+             sw_version=module.get_sw_version(),
+             serial_number=module.get_serial(),
+         )
++        ir.async_delete_issue(hass, DOMAIN, f"stale_device_{entry_id}_{address}")
++
++    registered_addresses: set[str] = set()
++    for device in dr.async_entries_for_config_entry(dev_reg, entry_id):
++        device_address: str | None = next(
++            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN),
++            None,
++        )
++        if device_address is None or device.via_device_id is not None:
++            continue
++        registered_addresses.add(device_address)
++        if device_address in found_addresses:
++            continue
++        ir.async_create_issue(
++            hass,
++            DOMAIN,
++            f"stale_device_{entry_id}_{device_address}",
++            is_fixable=False,
++            is_persistent=True,
++            severity=ir.IssueSeverity.WARNING,
++            translation_key="stale_device",
++            translation_placeholders={
++                "name": device.name_by_user or device.name or device_address,
++                "address": device_address,
++            },
++        )
++
++    issue_prefix = f"stale_device_{entry_id}_"
++    issue_reg = ir.async_get(hass)
++    for domain, issue_id in list(issue_reg.issues):
++        if domain == DOMAIN and issue_id.startswith(issue_prefix):
++            address = issue_id[len(issue_prefix) :]
++            if address not in registered_addresses:
++                ir.async_delete_issue(hass, DOMAIN, issue_id)
++
++
++async def velbus_scan_task(
++    controller: Velbus, hass: HomeAssistant, entry_id: str
++) -> None:
++    """Task to offload the long running scan."""
++    try:
++        await controller.start()
++    except ConnectionError as ex:
++        raise PlatformNotReady(
++            f"Connection error while connecting to Velbus {entry_id}: {ex}"
++        ) from ex
++    _update_devices_and_issues(hass, controller, entry_id)
+ 
+ 
+ def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
+@@ -89,6 +138,55 @@ def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
+             dev_reg.async_update_device(device.id, new_identifiers=new_identifier)
+ 
+ 
++async def _migrate_property_unique_ids(hass: HomeAssistant, entry_id: str) -> None:
++    """Ensure property entity unique_ids use {serial}-{property_key} format."""
++    ent_reg = er.async_get(hass)
++    dev_reg = dr.async_get(hass)
++
++    property_key_map = await hass.async_add_executor_job(get_property_key_map)
++    for entry in er.async_entries_for_config_entry(ent_reg, entry_id):
++        if not entry.original_name or not entry.device_id:
++            continue
++        property_key = property_key_map.get(entry.original_name)
++        if property_key is None:
++            continue
++        device = dev_reg.async_get(entry.device_id)
++        if device is None or device.via_device_id is not None:
++            continue
++        serial = device.serial_number or next(
++            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN), None
++        )
++        if serial is None:
++            _LOGGER.debug(
++                "Skipping unique_id migration for entity %s: device %s has no serial number or Velbus identifier",
++                entry.entity_id,
++                device.id,
++            )
++            continue
++
++        expected_unique_id = f"{serial}-{property_key}"
++        if entry.unique_id != expected_unique_id:
++            if ent_reg.async_get_entity_id(entry.domain, DOMAIN, expected_unique_id):
++                # Target unique_id already exists (created by new code) — remove stale entry
++                _LOGGER.debug(
++                    "Removing stale entity %s with outdated unique_id %s",
++                    entry.entity_id,
++                    entry.unique_id,
++                )
++                ent_reg.async_remove(entry.entity_id)
++            else:
++                _LOGGER.debug(
++                    "Migrating unique_id %s → %s", entry.unique_id, expected_unique_id
++                )
++                ent_reg.async_update_entity(
++                    entry.entity_id, new_unique_id=expected_unique_id
++                )
++        else:
++            _LOGGER.debug(
++                "Unique_id is ok: %s = %s", entry.unique_id, expected_unique_id
++            )
++
++
+ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+     """Set up the actions for the Velbus component."""
+     async_setup_services(hass)
+@@ -110,11 +208,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
+             translation_key="connection_failed",
+         ) from error
+ 
++    _migrate_device_identifiers(hass, entry.entry_id)
++    # Migrate unique ids before the bus scan to preserve entity history
++    await _migrate_property_unique_ids(hass, entry.entry_id)
++
+     task = hass.async_create_task(velbus_scan_task(controller, hass, entry.entry_id))
+     entry.runtime_data = VelbusData(controller=controller, scan_task=task)
+ 
+-    _migrate_device_identifiers(hass, entry.entry_id)
+-
+     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+ 
+     return True
+diff --git a/homeassistant/components/velbus/entity.py b/homeassistant/components/velbus/entity.py
+index e259f99462e..35d021cc60b 100644
+--- a/homeassistant/components/velbus/entity.py
++++ b/homeassistant/components/velbus/entity.py
+@@ -32,7 +32,6 @@ class VelbusEntity(Entity):
+         """Initialize a Velbus entity."""
+         self._channel = channel
+         self._module_address = str(channel.get_module_address())
+-        self._attr_name = channel.get_name()
+         self._attr_device_info = DeviceInfo(
+             identifiers={
+                 (DOMAIN, self._get_identifier()),
+@@ -49,8 +48,12 @@ class VelbusEntity(Entity):
+                 DOMAIN,
+                 self._module_address,
+             )
++        self._attr_name = channel.get_name()
+         serial = channel.get_module_serial() or self._module_address
+-        self._attr_unique_id = f"{serial}-{channel.get_channel_number()}"
++        if isinstance(channel, VelbusProperty):
++            self._attr_unique_id = f"{serial}-{channel.get_property_key()}"
++        else:
++            self._attr_unique_id = f"{serial}-{channel.get_channel_number()}"
+ 
+     def _get_identifier(self) -> str:
+         """Return the identifier of the entity."""
+diff --git a/homeassistant/components/velbus/quality_scale.yaml b/homeassistant/components/velbus/quality_scale.yaml
+index 0550837aed1..8d9002c0c41 100644
+--- a/homeassistant/components/velbus/quality_scale.yaml
++++ b/homeassistant/components/velbus/quality_scale.yaml
+@@ -58,11 +58,8 @@ rules:
+   exception-translations: done
+   icon-translations: done
+   reconfiguration-flow: done
+-  repair-issues:
+-    status: exempt
+-    comment: |
+-      This integration doesn't have any cases where raising an issue is needed.
+-  stale-devices: todo
++  repair-issues: done
++  stale-devices: done
+   # Platinum
+   async-dependency: done
+   inject-websession:
+diff --git a/homeassistant/components/velbus/select.py b/homeassistant/components/velbus/select.py
+index baf7ff4986a..e33f5afc2e6 100644
+--- a/homeassistant/components/velbus/select.py
++++ b/homeassistant/components/velbus/select.py
+@@ -40,7 +40,6 @@ class VelbusSelect(VelbusEntity, SelectEntity):
+         """Initialize a select Velbus entity."""
+         super().__init__(channel)
+         self._attr_options = self._channel.get_options()
+-        self._attr_unique_id = f"{self._attr_unique_id}-program_select"
+ 
+     @api_call
+     async def async_select_option(self, option: str) -> None:
+diff --git a/homeassistant/components/velbus/services.py b/homeassistant/components/velbus/services.py
+index 3a4fce1071e..ce067c9f497 100644
+--- a/homeassistant/components/velbus/services.py
++++ b/homeassistant/components/velbus/services.py
+@@ -34,6 +34,8 @@ def async_setup_services(hass: HomeAssistant) -> None:
+ 
+     async def scan(call: ServiceCall) -> None:
+         """Handle a scan service call."""
++        from . import _update_devices_and_issues  # noqa: PLC0415
++
+         entry: VelbusConfigEntry = service.async_get_config_entry(
+             call.hass, DOMAIN, call.data[CONF_CONFIG_ENTRY]
+         )
+@@ -45,6 +47,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
+                 translation_key="scan_failed",
+                 translation_placeholders={"error": str(exc)},
+             ) from exc
++        _update_devices_and_issues(hass, entry.runtime_data.controller, entry.entry_id)
+ 
+     async def syn_clock(call: ServiceCall) -> None:
+         """Handle a sync clock service call."""
+diff --git a/homeassistant/components/velbus/strings.json b/homeassistant/components/velbus/strings.json
+index c27808a51f8..30d40d8ff27 100644
+--- a/homeassistant/components/velbus/strings.json
++++ b/homeassistant/components/velbus/strings.json
+@@ -86,6 +86,10 @@
+     "deprecated_interface_parameter": {
+       "description": "The 'interface' parameter in the Velbus actions is deprecated. The 'config_entry' parameter should be used going forward.\n\nPlease adjust your automations or scripts to fix this issue.",
+       "title": "Deprecated 'interface' parameter"
++    },
++    "stale_device": {
++      "description": "The Velbus module **{name}** (address {address}) was not found during the last bus scan. It may have been disconnected or removed.\n\nIf this module has been permanently removed, you can delete it from Home Assistant via the device page. If it is temporarily disconnected, this warning will disappear automatically once it is found again on the next scan.",
++      "title": "Velbus module not found on bus: {name}"
+     }
+   },
+   "services": {
