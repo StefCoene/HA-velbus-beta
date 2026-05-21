@@ -3,7 +3,7 @@ https://github.com/home-assistant/core/pulls?q=is%3Apr++author%3AStefCoene++stat
 
 It also depends on my version of velbus-aio: https://github.com/StefCoene/velbus-aio
 
-You can add this in HAOS via HACS.
+You can add this via HACS.
 
 It will overwrite the built-in Velbus intergration.
 
