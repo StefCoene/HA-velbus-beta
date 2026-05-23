@@ -23,7 +23,7 @@
   ],
   "quality_scale": "silver",
   "requirements": [
-    "velbus-aio @ git+https://github.com/StefCoene/velbus-aio.git@stef/ha-fixes"
+    "velbus-aio @ git+https://github.com/StefCoene/velbus-aio.git@7ab344a1bc9bcd6dcba488d5e8c0d3e56601624d"
   ],
   "usb": [
     {
