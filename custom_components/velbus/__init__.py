@@ -1,27 +1,26 @@
 """Support for Velbus devices."""
 
-from __future__ import annotations
-
 import asyncio
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 import logging
 import os
 import shutil
+from typing import Any
 
 from velbusaio.controller import Velbus
 from velbusaio.exceptions import VelbusConnectionFailed
-from velbusaio.helpers import get_property_key_map
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady, PlatformNotReady
 from homeassistant.helpers import (
     config_validation as cv,
     device_registry as dr,
-    entity_registry as er,
     issue_registry as ir,
 )
+from homeassistant.helpers.device_registry import EventDeviceRegistryUpdatedData
 from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.helpers.typing import ConfigType
 
@@ -52,63 +51,8 @@ class VelbusData:
 
     controller: Velbus
     scan_task: asyncio.Task
-
-
-def _update_devices_and_issues(
-    hass: HomeAssistant, controller: Velbus, entry_id: str
-) -> None:
-    """Sync device registry and stale-device repair issues with the current bus state."""
-    dev_reg = dr.async_get(hass)
-    found_addresses: set[str] = set()
-    for module_address, module in controller.get_modules().items():
-        address = str(module_address)
-        found_addresses.add(address)
-        dev_reg.async_get_or_create(
-            config_entry_id=entry_id,
-            identifiers={
-                (DOMAIN, address),
-            },
-            manufacturer="Velleman",
-            model=module.get_type_name(),
-            model_id=str(module.get_type()),
-            name=f"{module.get_name()} ({module.get_type_name()})",
-            sw_version=module.get_sw_version(),
-            serial_number=module.get_serial(),
-        )
-        ir.async_delete_issue(hass, DOMAIN, f"stale_device_{entry_id}_{address}")
-
-    registered_addresses: set[str] = set()
-    for device in dr.async_entries_for_config_entry(dev_reg, entry_id):
-        device_address: str | None = next(
-            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN),
-            None,
-        )
-        if device_address is None or device.via_device_id is not None:
-            continue
-        registered_addresses.add(device_address)
-        if device_address in found_addresses:
-            continue
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            f"stale_device_{entry_id}_{device_address}",
-            is_fixable=False,
-            is_persistent=True,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="stale_device",
-            translation_placeholders={
-                "name": device.name_by_user or device.name or device_address,
-                "address": device_address,
-            },
-        )
-
-    issue_prefix = f"stale_device_{entry_id}_"
-    issue_reg = ir.async_get(hass)
-    for domain, issue_id in list(issue_reg.issues):
-        if domain == DOMAIN and issue_id.startswith(issue_prefix):
-            address = issue_id[len(issue_prefix) :]
-            if address not in registered_addresses:
-                ir.async_delete_issue(hass, DOMAIN, issue_id)
+    on_disconnect: Callable[[], Coroutine[Any, Any, None]]
+    on_reconnect: Callable[[], Coroutine[Any, Any, None]]
 
 
 async def velbus_scan_task(
@@ -121,7 +65,21 @@ async def velbus_scan_task(
         raise PlatformNotReady(
             f"Connection error while connecting to Velbus {entry_id}: {ex}"
         ) from ex
-    _update_devices_and_issues(hass, controller, entry_id)
+    # create all modules
+    dev_reg = dr.async_get(hass)
+    for module in controller.get_modules().values():
+        dev_reg.async_get_or_create(
+            config_entry_id=entry_id,
+            identifiers={
+                (DOMAIN, str(module.get_addresses()[0])),
+            },
+            manufacturer="Velleman",
+            model=module.get_type_name(),
+            model_id=str(module.get_type()),
+            name=f"{module.get_name()} ({module.get_type_name()})",
+            sw_version=module.get_sw_version(),
+            serial_number=module.get_serial(),
+        )
 
 
 def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
@@ -138,53 +96,29 @@ def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
             dev_reg.async_update_device(device.id, new_identifiers=new_identifier)
 
 
-async def _migrate_property_unique_ids(hass: HomeAssistant, entry_id: str) -> None:
-    """Ensure property entity unique_ids use {serial}-{property_key} format."""
-    ent_reg = er.async_get(hass)
-    dev_reg = dr.async_get(hass)
+def _make_connection_callbacks(
+    hass: HomeAssistant, entry_id: str
+) -> tuple[
+    Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
+]:
+    """Return (on_disconnect, on_reconnect) issue-registry callbacks."""
+    issue_id = f"connection_lost_{entry_id}"
 
-    property_key_map = await hass.async_add_executor_job(get_property_key_map)
-    for entry in er.async_entries_for_config_entry(ent_reg, entry_id):
-        if not entry.original_name or not entry.device_id:
-            continue
-        property_key = property_key_map.get(entry.original_name)
-        if property_key is None:
-            continue
-        device = dev_reg.async_get(entry.device_id)
-        if device is None or device.via_device_id is not None:
-            continue
-        serial = device.serial_number or next(
-            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN), None
+    async def on_disconnect() -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="connection_lost",
         )
-        if serial is None:
-            _LOGGER.debug(
-                "Skipping unique_id migration for entity %s: device %s has no serial number or Velbus identifier",
-                entry.entity_id,
-                device.id,
-            )
-            continue
 
-        expected_unique_id = f"{serial}-{property_key}"
-        if entry.unique_id != expected_unique_id:
-            if ent_reg.async_get_entity_id(entry.domain, DOMAIN, expected_unique_id):
-                # Target unique_id already exists (created by new code) — remove stale entry
-                _LOGGER.debug(
-                    "Removing stale entity %s with outdated unique_id %s",
-                    entry.entity_id,
-                    entry.unique_id,
-                )
-                ent_reg.async_remove(entry.entity_id)
-            else:
-                _LOGGER.debug(
-                    "Migrating unique_id %s → %s", entry.unique_id, expected_unique_id
-                )
-                ent_reg.async_update_entity(
-                    entry.entity_id, new_unique_id=expected_unique_id
-                )
-        else:
-            _LOGGER.debug(
-                "Unique_id is ok: %s = %s", entry.unique_id, expected_unique_id
-            )
+    async def on_reconnect() -> None:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+    return on_disconnect, on_reconnect
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -208,12 +142,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
             translation_key="connection_failed",
         ) from error
 
-    _migrate_device_identifiers(hass, entry.entry_id)
-    # Migrate unique ids before the bus scan to preserve entity history
-    await _migrate_property_unique_ids(hass, entry.entry_id)
+    on_disconnect, on_reconnect = _make_connection_callbacks(hass, entry.entry_id)
+    controller.add_disconnect_callback(on_disconnect)
+    controller.add_connect_callback(on_reconnect)
 
     task = hass.async_create_task(velbus_scan_task(controller, hass, entry.entry_id))
-    entry.runtime_data = VelbusData(controller=controller, scan_task=task)
+    entry.runtime_data = VelbusData(
+        controller=controller,
+        scan_task=task,
+        on_disconnect=on_disconnect,
+        on_reconnect=on_reconnect,
+    )
+
+    _migrate_device_identifiers(hass, entry.entry_id)
+
+    @callback
+    def _handle_device_registry_updated(
+        event: Event[EventDeviceRegistryUpdatedData],
+    ) -> None:
+        if event.data["action"] != "update":
+            return
+        changes = event.data["changes"]
+        if "via_device_id" not in changes or changes["via_device_id"] is None:
+            return
+        dev_reg = dr.async_get(hass)
+        sub_device = dev_reg.async_get(event.data["device_id"])
+        if (
+            sub_device is None
+            or entry.entry_id not in sub_device.config_entries
+            or sub_device.via_device_id is not None
+        ):
+            return
+        previous_parent_id: str = changes["via_device_id"]
+        if dev_reg.async_get(previous_parent_id) is not None:
+            return
+        dev_reg.async_update_device(
+            sub_device.id, remove_config_entry_id=entry.entry_id
+        )
+
+    entry.async_on_unload(
+        hass.bus.async_listen(
+            dr.EVENT_DEVICE_REGISTRY_UPDATED, _handle_device_registry_updated
+        )
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -222,8 +193,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bool:
     """Unload (close) the velbus connection."""
+    data = entry.runtime_data
+    data.controller.remove_disconnect_callback(data.on_disconnect)
+    data.controller.remove_connect_callback(data.on_reconnect)
+    ir.async_delete_issue(hass, DOMAIN, f"connection_lost_{entry.entry_id}")
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    await entry.runtime_data.controller.stop()
+    await data.controller.stop()
     return unload_ok
 
 
@@ -240,18 +215,12 @@ async def async_remove_config_entry_device(
     config_entry: VelbusConfigEntry,
     device_entry: dr.DeviceEntry,
 ) -> bool:
-    """Allow removing a Velbus device and detach its sub-devices.
+    """Allow removing this config entry from a Velbus device.
 
-    Sub-devices are detached from this config entry when their parent is
-    removed. If the device is still on the bus, it may be recreated when
-    the integration is reloaded or started again.
+    When the config entry is removed from a device, its sub-devices are detached
+    from this config entry as well. If the device is still on the bus, it may be
+    recreated when the integration is reloaded or started again.
     """
-    dev_reg = dr.async_get(hass)
-    for sub_device in dr.async_entries_for_config_entry(dev_reg, config_entry.entry_id):
-        if sub_device.via_device_id == device_entry.id:
-            dev_reg.async_update_device(
-                sub_device.id, remove_config_entry_id=config_entry.entry_id
-            )
     return True
 
 
@@ -263,7 +232,8 @@ async def async_migrate_entry(
         "Migrating from version %s.%s", config_entry.version, config_entry.minor_version
     )
 
-    # This is the config entry migration for swapping the usb unique id to the serial number
+    # This is the config entry migration for swapping the
+    # usb unique id to the serial number
     # migrate from 2.1 to 2.2
     if (
         config_entry.version < 3
