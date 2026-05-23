@@ -1,12 +1,12 @@
 """Support for Velbus devices."""
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 import logging
 import os
 import shutil
-from typing import Any
 
 from velbusaio.controller import Velbus
 from velbusaio.exceptions import VelbusConnectionFailed
@@ -51,8 +51,6 @@ class VelbusData:
 
     controller: Velbus
     scan_task: asyncio.Task
-    on_disconnect: Callable[[], Coroutine[Any, Any, None]]
-    on_reconnect: Callable[[], Coroutine[Any, Any, None]]
 
 
 async def velbus_scan_task(
@@ -96,31 +94,6 @@ def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
             dev_reg.async_update_device(device.id, new_identifiers=new_identifier)
 
 
-def _make_connection_callbacks(
-    hass: HomeAssistant, entry_id: str
-) -> tuple[
-    Callable[[], Coroutine[Any, Any, None]], Callable[[], Coroutine[Any, Any, None]]
-]:
-    """Return (on_disconnect, on_reconnect) issue-registry callbacks."""
-    issue_id = f"connection_lost_{entry_id}"
-
-    async def on_disconnect() -> None:
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            issue_id,
-            is_fixable=False,
-            is_persistent=True,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key="connection_lost",
-        )
-
-    async def on_reconnect() -> None:
-        ir.async_delete_issue(hass, DOMAIN, issue_id)
-
-    return on_disconnect, on_reconnect
-
-
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the actions for the Velbus component."""
     async_setup_services(hass)
@@ -142,17 +115,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
             translation_key="connection_failed",
         ) from error
 
-    on_disconnect, on_reconnect = _make_connection_callbacks(hass, entry.entry_id)
+    issue_id = f"connection_lost_{entry.entry_id}"
+
+    async def on_disconnect() -> None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="connection_lost",
+        )
+
+    async def on_reconnect() -> None:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+
     controller.add_disconnect_callback(on_disconnect)
     controller.add_connect_callback(on_reconnect)
+    entry.async_on_unload(
+        lambda: controller.remove_disconnect_callback(on_disconnect)
+    )
+    entry.async_on_unload(
+        lambda: controller.remove_connect_callback(on_reconnect)
+    )
+    entry.async_on_unload(lambda: ir.async_delete_issue(hass, DOMAIN, issue_id))
 
     task = hass.async_create_task(velbus_scan_task(controller, hass, entry.entry_id))
-    entry.runtime_data = VelbusData(
-        controller=controller,
-        scan_task=task,
-        on_disconnect=on_disconnect,
-        on_reconnect=on_reconnect,
-    )
+    entry.runtime_data = VelbusData(controller=controller, scan_task=task)
 
     _migrate_device_identifiers(hass, entry.entry_id)
 
@@ -193,12 +183,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bool:
     """Unload (close) the velbus connection."""
-    data = entry.runtime_data
-    data.controller.remove_disconnect_callback(data.on_disconnect)
-    data.controller.remove_connect_callback(data.on_reconnect)
-    ir.async_delete_issue(hass, DOMAIN, f"connection_lost_{entry.entry_id}")
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    await data.controller.stop()
+    await entry.runtime_data.controller.stop()
     return unload_ok
 
 
