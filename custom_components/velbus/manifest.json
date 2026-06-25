@@ -1,7 +1,7 @@
 {
   "domain": "velbus",
   "name": "Velbus",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "codeowners": [
     "@Cereal2nd",
     "@brefra",
@@ -23,7 +23,7 @@
   ],
   "quality_scale": "silver",
   "requirements": [
-    "velbus-aio @ git+https://github.com/StefCoene/velbus-aio.git@b1bee869627e25cf34020b387aad8ee5cdc990c4"
+    "velbus-aio @ git+https://github.com/StefCoene/velbus-aio.git@bd9af9a27ccbc23d0306642b61c937293daa9942"
   ],
   "usb": [
     {
