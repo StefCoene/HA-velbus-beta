@@ -117,6 +117,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
 
     issue_id = f"connection_lost_{entry.entry_id}"
 
+    # The connection is up, so any connection_lost issue is stale. It cannot be
+    # cleared by on_reconnect: the controller reports the initial connection while
+    # connect() is still running, before the callback below is registered.
+    ir.async_delete_issue(hass, DOMAIN, issue_id)
+
     async def on_disconnect() -> None:
         ir.async_create_issue(
             hass,
