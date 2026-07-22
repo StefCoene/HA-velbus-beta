@@ -1,7 +1,7 @@
 This is a repository that I keep up-to-date with my PR's for HAOS core:
 https://github.com/home-assistant/core/pulls?q=is%3Apr++author%3AStefCoene++state%3Aopen
 
-It also depends on my version of velbus-aio: https://github.com/StefCoene/velbus-aio
+It depends on velbus-aio 2026.7.3: https://github.com/Cereal2nd/velbus-aio/releases/tag/2026.7.3
 
 You can add this via HACS.
 
