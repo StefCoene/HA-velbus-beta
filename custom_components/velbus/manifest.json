@@ -1,7 +1,7 @@
 {
   "domain": "velbus",
   "name": "Velbus",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "codeowners": [
     "@Cereal2nd",
     "@brefra",
@@ -19,11 +19,12 @@
     "velbus-parser",
     "velbus-module",
     "velbus-packet",
-    "velbus-protocol"
+    "velbus-protocol",
+    "velbus-handler"
   ],
   "quality_scale": "silver",
   "requirements": [
-    "velbus-aio==2026.7.3"
+    "velbus-aio==2026.7.4"
   ],
   "usb": [
     {
