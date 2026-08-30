@@ -65,7 +65,7 @@ rules:
   icon-translations: done
   reconfiguration-flow: done
   repair-issues: done
-  stale-devices: todo
+  stale-devices: done
   # Platinum
   async-dependency: done
   inject-websession:

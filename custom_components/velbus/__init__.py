@@ -198,10 +198,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
             translation_key="connection_failed",
         ) from error
 
-    _migrate_device_identifiers(hass, entry.entry_id)
-    # Migrate unique ids before the bus scan to preserve entity history
-    await _migrate_property_unique_ids(hass, entry.entry_id)
-
     issue_id = f"connection_lost_{entry.entry_id}"
 
     # The connection is up, so any connection_lost issue is stale. It cannot be
@@ -229,6 +225,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
     entry.async_on_unload(lambda: controller.remove_connect_callback(on_reconnect))
     entry.async_on_unload(lambda: ir.async_delete_issue(hass, DOMAIN, issue_id))
 
+    _migrate_device_identifiers(hass, entry.entry_id)
+    # Migrate unique ids before the bus scan to preserve entity history
+    await _migrate_property_unique_ids(hass, entry.entry_id)
+
     task = hass.async_create_task(velbus_scan_task(controller, hass, entry.entry_id))
     entry.runtime_data = VelbusData(controller=controller, scan_task=task)
 
@@ -246,6 +246,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> b
 
 async def async_remove_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> None:
     """Remove the velbus entry, so we also have to cleanup the cache dir."""
+    # If the initial connection fails, async_setup_entry raises ConfigEntryNotReady
+    # before async_on_unload is registered, so the unload callback never clears this
+    # persistent issue. Delete it here too, so a removed entry doesn't leave it behind.
+    ir.async_delete_issue(hass, DOMAIN, f"connection_lost_{entry.entry_id}")
     await hass.async_add_executor_job(
         shutil.rmtree,
         hass.config.path(STORAGE_DIR, f"velbuscache-{entry.entry_id}"),
@@ -255,7 +259,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> N
 async def async_remove_config_entry_device(
     hass: HomeAssistant,
     config_entry: VelbusConfigEntry,
-    device_entry: dr.DeviceEntry,
+    device_entry: dr.AnyDeviceEntry,
 ) -> bool:
     """Allow removing a Velbus device and its sub-devices.
 
