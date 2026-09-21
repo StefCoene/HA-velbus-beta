@@ -1,7 +1,7 @@
 {
   "domain": "velbus",
   "name": "Velbus",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "codeowners": ["@Cereal2nd", "@brefra", "@StefCoene"],
   "config_flow": true,
   "dependencies": ["usb", "file_upload"],
@@ -16,7 +16,9 @@
     "velbus-handler"
   ],
   "quality_scale": "silver",
-  "requirements": ["velbus-aio==2026.7.5"],
+  "requirements": [
+    "velbus-aio @ git+https://github.com/WilliamCoenen/velbus-aio.git@59e2418052cfc2277d47bab0095311389da0bca7"
+  ],
   "usb": [
     {
       "pid": "0B1B",

@@ -52,63 +52,6 @@ class VelbusData:
     scan_task: asyncio.Task
 
 
-def _update_devices_and_issues(
-    hass: HomeAssistant, controller: Velbus, entry_id: str
-) -> None:
-    """Sync device registry and stale-device repair issues with the current bus state."""
-    dev_reg = dr.async_get(hass)
-    found_addresses: set[str] = set()
-    for module_address, module in controller.get_modules().items():
-        address = str(module_address)
-        found_addresses.add(address)
-        dev_reg.async_get_or_create(
-            config_entry_id=entry_id,
-            identifiers={
-                (DOMAIN, address),
-            },
-            manufacturer="Velleman",
-            model=module.get_type_name(),
-            model_id=str(module.get_type()),
-            name=f"{module.get_name()} ({module.get_type_name()})",
-            sw_version=module.get_sw_version(),
-            serial_number=module.get_serial(),
-        )
-        ir.async_delete_issue(hass, DOMAIN, f"stale_device_{entry_id}_{address}")
-
-    registered_addresses: set[str] = set()
-    for device in dr.async_entries_for_config_entry(dev_reg, entry_id):
-        device_address: str | None = next(
-            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN),
-            None,
-        )
-        if device_address is None or device.via_device_id is not None:
-            continue
-        registered_addresses.add(device_address)
-        if device_address in found_addresses:
-            continue
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            f"stale_device_{entry_id}_{device_address}",
-            is_fixable=False,
-            is_persistent=True,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="stale_device",
-            translation_placeholders={
-                "name": device.name_by_user or device.model or device_address,
-                "address": device_address,
-            },
-        )
-
-    issue_prefix = f"stale_device_{entry_id}_"
-    issue_reg = ir.async_get(hass)
-    for domain, issue_id in list(issue_reg.issues):
-        if domain == DOMAIN and issue_id.startswith(issue_prefix):
-            address = issue_id[len(issue_prefix) :]
-            if address not in registered_addresses:
-                ir.async_delete_issue(hass, DOMAIN, issue_id)
-
-
 async def velbus_scan_task(
     controller: Velbus, hass: HomeAssistant, entry_id: str
 ) -> None:
@@ -119,7 +62,21 @@ async def velbus_scan_task(
         raise PlatformNotReady(
             f"Connection error while connecting to Velbus {entry_id}: {ex}"
         ) from ex
-    _update_devices_and_issues(hass, controller, entry_id)
+    # create all modules
+    dev_reg = dr.async_get(hass)
+    for module in controller.get_modules().values():
+        dev_reg.async_get_or_create(
+            config_entry_id=entry_id,
+            identifiers={
+                (DOMAIN, str(module.get_addresses()[0])),
+            },
+            manufacturer="Velleman",
+            model=module.get_type_name(),
+            model_id=str(module.get_type()),
+            name=f"{module.get_name()} ({module.get_type_name()})",
+            sw_version=module.get_sw_version(),
+            serial_number=module.get_serial(),
+        )
 
 
 def _migrate_device_identifiers(hass: HomeAssistant, entry_id: str) -> None:
@@ -190,22 +147,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
         cache_dir=hass.config.path(STORAGE_DIR, f"velbuscache-{entry.entry_id}"),
         vlp_file=entry.data.get(CONF_VLP_FILE),
     )
-    try:
-        await controller.connect()
-    except VelbusConnectionFailed as error:
-        raise ConfigEntryNotReady(
-            translation_domain=DOMAIN,
-            translation_key="connection_failed",
-        ) from error
-
     issue_id = f"connection_lost_{entry.entry_id}"
 
-    # The connection is up, so any connection_lost issue is stale. It cannot be
-    # cleared by on_reconnect: the controller reports the initial connection while
-    # connect() is still running, before the callback below is registered.
-    ir.async_delete_issue(hass, DOMAIN, issue_id)
-
-    async def on_disconnect() -> None:
+    def _create_connection_lost_issue() -> None:
         ir.async_create_issue(
             hass,
             DOMAIN,
@@ -214,7 +158,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: VelbusConfigEntry) -> bo
             is_persistent=True,
             severity=ir.IssueSeverity.ERROR,
             translation_key="connection_lost",
+            translation_placeholders={"name": entry.title},
         )
+
+    try:
+        await controller.connect()
+    except VelbusConnectionFailed as error:
+        # A reload that fails to reconnect starts from here too: async_unload_entry
+        # already cleared the issue via the async_on_unload hook below, and this is
+        # the only chance to put it back before setup bails out into SETUP_RETRY.
+        _create_connection_lost_issue()
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="connection_failed",
+        ) from error
+
+    # The connection is up, so any connection_lost issue is stale. It cannot be
+    # cleared by on_reconnect: the controller reports the initial connection while
+    # connect() is still running, before the callback below is registered.
+    ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+    async def on_disconnect() -> None:
+        _create_connection_lost_issue()
 
     async def on_reconnect() -> None:
         ir.async_delete_issue(hass, DOMAIN, issue_id)
