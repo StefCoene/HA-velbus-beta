@@ -5,6 +5,6 @@ It depends on the latest velbus-aio version.
 
 You can add this via HACS.
 
-It will overwrite the built-in Velbus intergration.
+It will overwrite the built-in Velbus integration.
 
-You can help ny test and reporting any issues.
+You can help me by testing and reporting any issues.
